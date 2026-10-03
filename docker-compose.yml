@@ -1,0 +1,58 @@
+# One command starts everything:  docker compose up --build
+x-app-env: &app-env
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgresql://sensor:sensor@postgres:5432/sensors
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sensor
+      POSTGRES_PASSWORD: sensor
+      POSTGRES_DB: sensors
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sensor -d sensors"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      <<: *app-env
+      WORKER_DELAY_SECONDS: ${WORKER_DELAY_SECONDS:-0}
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped        # if the worker crashes, Docker restarts it and it resumes from the queue
+
+  simulator:
+    build: .
+    command: python simulator/simulate.py --url http://api:8000/readings
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
