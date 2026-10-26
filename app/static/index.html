@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sensor Monitor</title>
+<style>
+  :root {
+    --bg: #eef1f4; --panel: #ffffff; --ink: #1b2733; --muted: #5b6b7a; --line: #d5dce3;
+    --ok: #2f855a; --warn: #b7791f; --alarm: #c0392b; --accent: #1f6f8b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12181e; --panel: #1a222a; --ink: #e6ecf1; --muted: #93a3b1; --line: #2c3945;
+      --ok: #48bb78; --warn: #ecb44a; --alarm: #f2705f; --accent: #5bb3d0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 24px; margin-bottom: 20px; }
+  h1 { font-size: 22px; margin: 0; font-weight: 650; }
+  .conn { color: var(--muted); font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.alarm { background: var(--alarm); }
+
+  /* The one memorable element: the queue backlog bar. It makes the queue visible. */
+  .queue { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; margin-bottom: 20px; }
+  .queue-top { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .queue-top strong { font-size: 20px; font-variant-numeric: tabular-nums; }
+  .queue-top span { color: var(--muted); font-size: 14px; }
+  .bar { height: 8px; background: var(--bg); border-radius: 4px; margin-top: 10px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s ease; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px; min-width: 0; }
+  h2 { font-size: 16px; margin: 0 0 12px; font-weight: 650; }
+
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  td.num, th.num { text-align: right; }
+
+  ul { list-style: none; margin: 0; padding: 0; max-height: 460px; overflow-y: auto; }
+  li { border-left: 4px solid var(--warn); padding: 8px 10px; margin-bottom: 8px; background: var(--bg); border-radius: 0 4px 4px 0; }
+  li.spike { border-left-color: var(--alarm); }
+  li.stuck { border-left-color: var(--warn); }
+  li .meta { color: var(--muted); font-size: 13px; }
+  li .kind { font-weight: 650; }
+  li.fresh { animation: flash 1.2s ease-out 1; }
+  @keyframes flash { from { background: color-mix(in srgb, var(--alarm) 25%, var(--bg)); } to { background: var(--bg); } }
+  @media (prefers-reduced-motion: reduce) { li.fresh { animation: none; } .bar > div { transition: none; } }
+  .empty { color: var(--muted); padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Sensor Monitor</h1>
+    <div class="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting to live alerts...</span></div>
+  </header>
+
+  <div class="queue">
+    <div class="queue-top">
+      <div>Readings waiting in the queue: <strong id="backlog">0</strong></div>
+      <span id="total-alerts">0 alerts recorded</span>
+    </div>
+    <div class="bar"><div id="backlog-bar"></div></div>
+  </div>
+
+  <div class="grid">
+    <section>
+      <h2>Sensors</h2>
+      <table>
+        <thead><tr><th>Sensor</th><th class="num">Latest value</th><th>Last seen</th><th class="num">Alerts (5 min)</th></tr></thead>
+        <tbody id="sensors"></tbody>
+      </table>
+      <div class="empty" id="sensors-empty">No readings yet. Start the simulator to send some.</div>
+    </section>
+
+    <section>
+      <h2>Live alerts</h2>
+      <ul id="alerts"></ul>
+      <div class="empty" id="alerts-empty">No alerts yet.</div>
+    </section>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// Text is always set with textContent, never innerHTML: sensor ids come from outside,
+// so treating them as HTML would let anyone inject a script into this page.
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function timeAgo(iso) {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (seconds < 60) return seconds + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + " min ago";
+  return Math.round(seconds / 3600) + " h ago";
+}
+
+async function getJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(url + " returned " + response.status);
+  return response.json();
+}
+
+async function refreshSensors() {
+  const rows = await getJSON("/sensors");
+  const body = $("sensors");
+  body.replaceChildren();
+  $("sensors-empty").style.display = rows.length ? "none" : "block";
+  for (const row of rows) {
+    const tr = el("tr");
+    const name = el("td");
+    const status = el("span", "dot " + (row.recent_alerts > 0 ? "alarm" : "ok"));
+    status.title = row.recent_alerts > 0 ? "Raised alerts recently" : "Normal";
+    name.append(status, " ", row.sensor_id);
+    tr.append(name, el("td", "num", Number(row.value).toFixed(1)), el("td", "", timeAgo(row.ts)),
+              el("td", "num", String(row.recent_alerts)));
+    body.append(tr);
+  }
+}
+
+let backlogPeak = 1;
+async function refreshStats() {
+  const stats = await getJSON("/stats");
+  const backlog = stats.backlog ?? 0;
+  backlogPeak = Math.max(backlogPeak, backlog, 100);
+  $("backlog").textContent = backlog.toLocaleString();
+  $("backlog-bar").style.width = Math.min(100, (backlog / backlogPeak) * 100) + "%";
+  $("total-alerts").textContent = stats.total_alerts.toLocaleString() + " alerts recorded";
+}
+
+function addAlert(alert, fresh) {
+  $("alerts-empty").style.display = "none";
+  const li = el("li", alert.kind + (fresh ? " fresh" : ""));
+  const head = el("div");
+  head.append(el("span", "kind", alert.kind === "spike" ? "Spike" : alert.kind === "stuck" ? "Stuck sensor" : alert.kind));
+  li.append(head, el("div", "", alert.message),
+            el("div", "meta", new Date(alert.ts).toLocaleTimeString()));
+  $("alerts").prepend(li);
+  while ($("alerts").children.length > 100) $("alerts").lastChild.remove();
+}
+
+async function loadAlerts() {
+  const alerts = await getJSON("/alerts?limit=30");
+  alerts.reverse().forEach((a) => addAlert(a, false));   // oldest first, so newest ends on top
+}
+
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(scheme + "://" + location.host + "/ws/alerts");
+  socket.onopen = () => { $("conn-dot").className = "dot ok"; $("conn-text").textContent = "Live alerts connected"; };
+  socket.onmessage = (event) => addAlert(JSON.parse(event.data), true);
+  socket.onclose = () => {
+    $("conn-dot").className = "dot warn";
+    $("conn-text").textContent = "Disconnected. Reconnecting...";
+    setTimeout(connect, 2000);
+  };
+}
+
+async function poll() {
+  try { await Promise.all([refreshSensors(), refreshStats()]); } catch (e) { console.error(e); }
+}
+
+loadAlerts().catch(console.error);
+poll();
+setInterval(poll, 2000);
+connect();
+</script>
+</body>
+</html>
